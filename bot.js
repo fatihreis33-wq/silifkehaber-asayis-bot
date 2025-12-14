@@ -1,7 +1,7 @@
 import { chromium } from "@playwright/test";
 import fetch from "node-fetch";
 
-const WP_BASE = process.env.WP_BASE; // https://silifkehaber.com.tr
+const WP_BASE = (process.env.WP_BASE || "").replace(/\/$/, "");
 const BOT_TOKEN = process.env.BOT_TOKEN || "SH_Fatih1706@";
 
 if (!WP_BASE) {
@@ -9,7 +9,7 @@ if (!WP_BASE) {
   process.exit(1);
 }
 
-const PUSH_ENDPOINT = `${WP_BASE.replace(/\/$/, "")}/wp-json/silifke/v1/push`;
+const PUSH_ENDPOINT = `${WP_BASE}/wp-json/silifke/v1/push`;
 
 const SOURCES = [
   { name: "Mersin Emniyet", list: "https://www.mersin.pol.tr/haberler", host: "www.mersin.pol.tr" },
@@ -19,6 +19,7 @@ const SOURCES = [
 function clean(t) {
   return (t || "").replace(/\s+/g, " ").trim();
 }
+
 function esc(s) {
   return (s || "")
     .replaceAll("&", "&amp;")
@@ -28,11 +29,22 @@ function esc(s) {
     .replaceAll("'", "&#039;");
 }
 
-/** WP’de aynı kaynağı daha önce ekledik mi? (içerikte kaynak linki arar) */
+function cleanTitle(title) {
+  return clean(title)
+    .replace(/^Mersin\s+İl\s+Emniyet\s+Müdürlüğü\s*[-–—:|]\s*/i, "")
+    .replace(/^Mersin\s+Emniyet\s+Müdürlüğü\s*[-–—:|]\s*/i, "")
+    .replace(/^Mersin\s+İl\s+Jandarma\s+Komutanlığı\s*[-–—:|]\s*/i, "")
+    .replace(/^Mersin\s+Jandarma\s+Komutanlığı\s*[-–—:|]\s*/i, "")
+    .replace(/^Mersin\s+Jandarma\s*[-–—:|]\s*/i, "")
+    .replace(/^Basın\s+Duyurusu\s*[-–—:|]\s*/i, "")
+    .trim();
+}
+
+/** WP’de aynı kaynak linki daha önce var mı? */
 async function wpAlreadyPosted(sourceUrl) {
   try {
     const q = encodeURIComponent(sourceUrl);
-    const r = await fetch(`${WP_BASE.replace(/\/$/, "")}/wp-json/wp/v2/posts?search=${q}&per_page=5`);
+    const r = await fetch(`${WP_BASE}/wp-json/wp/v2/posts?search=${q}&per_page=10`);
     const j = await r.json();
     if (!Array.isArray(j)) return false;
     return j.some(p => (p?.content?.rendered || "").includes(sourceUrl));
@@ -41,22 +53,19 @@ async function wpAlreadyPosted(sourceUrl) {
   }
 }
 
-/** Plugin endpoint’ine post bas */
-async function pushToWp({ title, contentHtml, imageUrl, sourceUrl }) {
-  const payload = {
-    title,
-    content: contentHtml,
-    image: imageUrl || "",
-    source: sourceUrl || ""
-  };
-
+async function pushDraftToWp({ title, html, image, source }) {
   const r = await fetch(PUSH_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-bot-token": BOT_TOKEN
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify({
+      title,
+      content: html,
+      image: image || "",
+      source: source || ""
+    })
   });
 
   let j = null;
@@ -69,33 +78,31 @@ async function pushToWp({ title, contentHtml, imageUrl, sourceUrl }) {
   return j?.post_id || null;
 }
 
-/** Liste sayfasından detay linklerini çek (absolute + filtre) */
-async function scrapeList(page, host) {
-  const baseUrl = page.url();
+/** Liste sayfasından detay linklerini topla (iki site için ortak) */
+async function getNewsLinks(page, listUrl, host) {
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle").catch(() => {});
 
-  const items = await page.$$eval("a[href]", as =>
-    as
-      .map(a => ({
-        href: a.getAttribute("href") || "",
-        text: (a.textContent || "").replace(/\s+/g, " ").trim()
-      }))
-      .filter(x => x.href && x.text)
+  // Link adayları
+  const hrefs = await page.$$eval("a[href]", as =>
+    as.map(a => a.getAttribute("href") || "").filter(Boolean)
   );
 
-  const out = [];
+  const baseUrl = page.url();
+  const links = [];
   const seen = new Set();
 
-  for (const it of items) {
-    let url = it.href;
-
-    if (url.startsWith("/")) url = new URL(url, baseUrl).toString();
-    if (!url.startsWith("http")) continue;
+  for (let h of hrefs) {
+    // absolute
+    if (h.startsWith("/")) h = new URL(h, baseUrl).toString();
+    if (!h.startsWith("http")) continue;
 
     try {
-      const u = new URL(url);
+      const u = new URL(h);
       if (u.host !== host) continue;
       if (u.pathname === "/haberler" || u.pathname === "/haberler/") continue;
 
+      // detay gibi görünmeyenleri ele
       const looksDetail =
         u.pathname.includes("merkezicerik") ||
         /\d{2}[-/.]\d{2}[-/.]\d{4}/.test(u.pathname) ||
@@ -103,52 +110,73 @@ async function scrapeList(page, host) {
 
       if (!looksDetail) continue;
 
-      if (!seen.has(url)) {
-        seen.add(url);
-        out.push({ url, text: it.text });
+      if (!seen.has(h)) {
+        seen.add(h);
+        links.push(h);
       }
-      if (out.length >= 20) break;
-    } catch {
-      continue;
-    }
-  }
-
-  return out;
-}
-
-/** Detay sayfasından başlık + içerik + görsel */
-async function scrapeDetail(page, srcName) {
-  let title = "";
-
-  // h1 kısa bekle
-  try {
-    const h1 = page.locator("h1").first();
-    await h1.waitFor({ timeout: 5000 });
-    title = clean(await h1.textContent());
-  } catch {}
-
-  // og:title
-  if (!title) {
-    try {
-      const og = await page.locator('meta[property="og:title"]').first().getAttribute("content");
-      title = clean(og);
     } catch {}
   }
 
-  // <title>
+  return links.slice(0, 15);
+}
+
+async function pickImage(page) {
+  // 1) og:image
+  try {
+    const og = await page.locator('meta[property="og:image"]').first().getAttribute("content");
+    if (og) return og;
+  } catch {}
+
+  // 2) twitter:image
+  try {
+    const tw = await page.locator('meta[name="twitter:image"]').first().getAttribute("content");
+    if (tw) return tw;
+  } catch {}
+
+  // 3) img src / data-src / data-original
+  try {
+    const img = page.locator("article img, main img, img").first();
+    let src = await img.getAttribute("src");
+    if (!src) src = await img.getAttribute("data-src");
+    if (!src) src = await img.getAttribute("data-original");
+    if (src && src.startsWith("/")) src = new URL(src, page.url()).toString();
+    return src || "";
+  } catch {
+    return "";
+  }
+}
+
+async function scrapeDetail(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle").catch(() => {});
+
+  // Title: h1 -> og:title -> <title>
+  let title = "";
+  try {
+    title = await page.locator("h1").first().textContent();
+  } catch {}
+
   if (!title) {
-    try { title = clean(await page.title()); } catch {}
+    try {
+      title = await page.locator('meta[property="og:title"]').first().getAttribute("content");
+    } catch {}
   }
 
-  // içerik
+  if (!title) {
+    try { title = await page.title(); } catch {}
+  }
+
+  title = cleanTitle(title || "");
+
+  // Content: main/article öncelik
   let text = "";
   try {
-    const candidates = ["main", "article", ".content", ".icerik", ".page-content", ".container"];
+    const candidates = ["article", "main", ".content", ".icerik", ".page-content"];
     for (const sel of candidates) {
       const loc = page.locator(sel).first();
       if ((await loc.count().catch(() => 0)) > 0) {
         const t = clean(await loc.innerText().catch(() => ""));
-        if (t && t.length > 200) { text = t; break; }
+        if (t && t.length > 150) { text = t; break; }
       }
     }
     if (!text) text = clean(await page.locator("body").innerText());
@@ -156,38 +184,23 @@ async function scrapeDetail(page, srcName) {
     text = "";
   }
 
-  if (text.length > 6500) text = text.slice(0, 6500);
+  if (text.length > 7000) text = text.slice(0, 7000);
 
-  // görsel
-  let img = "";
-  try {
-    img = await page.locator("main img, article img, img").first().getAttribute("src");
-    if (img && img.startsWith("/")) img = new URL(img, page.url()).toString();
-    if (!img) img = "";
-  } catch {
-    img = "";
-  }
+  const image = await pickImage(page);
 
-  // paragrafla
-  const parts = text
+  // HTML’e çevir (paragraflı)
+  const paras = text
     .replace(/\r/g, "")
     .split(/\n{2,}/)
     .map(p => clean(p))
-    .filter(p => p.length >= 40)
-    .slice(0, 10);
+    .filter(p => p.length >= 20)
+    .slice(0, 20);
 
-  const pHtml = (parts.length ? parts : [text.slice(0, 900)])
-    .filter(Boolean)
-    .map(p => `<p>${esc(p)}</p>`)
-    .join("");
+  const html = paras.length
+    ? paras.map(p => `<p>${esc(p)}</p>`).join("")
+    : `<p>${esc(text)}</p>`;
 
-  // kaynak linki ayrıca plugin’e de gidecek ama içerikte de dursun
-  const html = `
-${pHtml}
-<p><small>Kaynak: <a href="${page.url()}" target="_blank" rel="nofollow noopener">${esc(srcName)}</a></small></p>
-  `.trim();
-
-  return { title, html, img };
+  return { title, html, image };
 }
 
 (async () => {
@@ -201,30 +214,29 @@ ${pHtml}
 
   for (const src of SOURCES) {
     console.log("Liste:", src.list);
-    await page.goto(src.list, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle").catch(() => {});
-
-    const links = await scrapeList(page, src.host);
+    const links = await getNewsLinks(page, src.list, src.host);
     console.log("Bulunan aday:", links.length);
 
-    for (const it of links) {
-      if (await wpAlreadyPosted(it.url)) continue;
+    for (const link of links) {
+      if (await wpAlreadyPosted(link)) continue;
 
-      console.log("Detay:", it.url);
-      await page.goto(it.url, { waitUntil: "domcontentloaded" });
-      await page.waitForLoadState("networkidle").catch(() => {});
+      console.log("Detay:", link);
+      const d = await scrapeDetail(page, link);
 
-      const d = await scrapeDetail(page, src.name);
-      const title = d.title || clean(it.text) || "Asayiş Haberi";
+      // Görsel mutlaka olsun istedin: görselsiz geç
+      if (!d.title || !d.image) {
+        console.log("⛔ Atlandı (başlık/görsel yok):", link);
+        continue;
+      }
 
-      const postId = await pushToWp({
-        title,
-        contentHtml: d.html,
-        imageUrl: d.img,
-        sourceUrl: it.url
+      const postId = await pushDraftToWp({
+        title: d.title,
+        html: d.html,
+        image: d.image,
+        source: link
       });
 
-      if (postId) console.log("✅ WP’ye eklendi:", postId);
+      if (postId) console.log("📝 Taslak eklendi:", postId);
     }
   }
 
