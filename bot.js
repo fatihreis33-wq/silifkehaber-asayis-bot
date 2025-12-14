@@ -15,7 +15,7 @@ const auth = "Basic " + Buffer.from(`${WP_USER}:${WP_APP_PASS}`).toString("base6
 
 const SOURCES = [
   { name: "Mersin Emniyet", list: "https://www.mersin.pol.tr/haberler", host: "www.mersin.pol.tr" },
-  { name: "Mersin Jandarma", list: "https://mersin.jandarma.gov.tr/haberler", host: "mersin.jandarma.gov.tr" }
+  { name: "Mersin İl Jandarma", list: "https://mersin.jandarma.gov.tr/haberler", host: "mersin.jandarma.gov.tr" }
 ];
 
 function clean(t) {
@@ -70,6 +70,7 @@ async function wpUploadImage(url) {
       },
       body: buf
     });
+
     const j = await r.json();
     if (!r.ok) return null;
     return j?.id || null;
@@ -99,8 +100,10 @@ async function wpCreatePost({ title, html, mediaId, catId, excerpt }) {
   return j?.id || null;
 }
 
-/** Liste sayfasından gerçek detay linklerini yakala (daha sıkı filtre) */
+/** Liste sayfasından gerçek detay linklerini yakala */
 async function scrapeList(page, host) {
+  const baseUrl = page.url();
+
   const items = await page.$$eval("a[href]", as =>
     as
       .map(a => ({
@@ -116,9 +119,7 @@ async function scrapeList(page, host) {
   for (const it of items) {
     let url = it.href;
 
-    // absolute yap
-   if (url.startsWith("/")) url = new URL(url, baseUrl).toString();
-
+    if (url.startsWith("/")) url = new URL(url, baseUrl).toString();
     if (!url.startsWith("http")) continue;
 
     try {
@@ -126,7 +127,7 @@ async function scrapeList(page, host) {
       if (u.host !== host) continue;
       if (u.pathname === "/haberler" || u.pathname === "/haberler/") continue;
 
-      // “detay” heuristikleri
+      // Detay linki gibi görünenleri tut
       const looksDetail =
         u.pathname.includes("merkezicerik") ||
         /\d{2}[-/.]\d{2}[-/.]\d{4}/.test(u.pathname) ||
@@ -149,37 +150,37 @@ async function scrapeList(page, host) {
 
 /** Detay sayfasından başlık + içerik + görsel (h1 yoksa fallback) */
 async function scrapeDetail(page, srcName) {
-  // h1 bekleme: kısa tut, yoksa fallback
   let title = "";
+
+  // 1) H1 varsa al (ama bekleme kısa)
   try {
     const h1 = page.locator("h1").first();
     await h1.waitFor({ timeout: 5000 });
     title = clean(await h1.textContent());
   } catch {}
 
+  // 2) og:title
   if (!title) {
-    // og:title
     try {
       const og = await page.locator('meta[property="og:title"]').first().getAttribute("content");
       title = clean(og);
     } catch {}
   }
 
+  // 3) <title>
   if (!title) {
-    // <title>
     try {
       title = clean(await page.title());
     } catch {}
   }
 
-  // içerik
+  // içerik (render sonrası)
   let text = "";
   try {
-    // olası ana alanlar
     const candidates = ["main", "article", ".content", ".icerik", ".page-content", ".container"];
     for (const sel of candidates) {
       const loc = page.locator(sel).first();
-      if ((await loc.count()) > 0) {
+      if ((await loc.count().catch(() => 0)) > 0) {
         const t = clean(await loc.innerText().catch(() => ""));
         if (t && t.length > 200) { text = t; break; }
       }
@@ -189,7 +190,7 @@ async function scrapeDetail(page, srcName) {
     text = "";
   }
 
-  if (text.length > 6000) text = text.slice(0, 6000);
+  if (text.length > 6500) text = text.slice(0, 6500);
 
   // görsel
   let img = null;
@@ -200,7 +201,7 @@ async function scrapeDetail(page, srcName) {
 
   const excerpt = clean(text).slice(0, 180);
 
-  // html paragrafla
+  // paragrafla
   const parts = text
     .replace(/\r/g, "")
     .split(/\n{2,}/)
@@ -208,7 +209,7 @@ async function scrapeDetail(page, srcName) {
     .filter(p => p.length >= 40)
     .slice(0, 10);
 
-  const pHtml = (parts.length ? parts : [text.slice(0, 800)])
+  const pHtml = (parts.length ? parts : [text.slice(0, 900)])
     .filter(Boolean)
     .map(p => `<p>${esc(p)}</p>`)
     .join("");
@@ -230,7 +231,6 @@ ${pHtml}
     userAgent: "Mozilla/5.0 (compatible; SilifkeHaberBot/1.0)"
   });
 
-  // Genel timeout’ları büyüt
   page.setDefaultNavigationTimeout(60000);
   page.setDefaultTimeout(30000);
 
