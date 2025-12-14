@@ -117,7 +117,8 @@ async function scrapeList(page, host) {
     let url = it.href;
 
     // absolute yap
-    if (url.startsWith("/")) url = new URL(url, location.href).toString();
+   if (url.startsWith("/")) url = new URL(url, baseUrl).toString();
+
     if (!url.startsWith("http")) continue;
 
     try {
