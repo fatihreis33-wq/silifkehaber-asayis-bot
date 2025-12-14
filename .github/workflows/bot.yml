@@ -1,4 +1,4 @@
-name: Asayis Bot
+name: Asayis Bot (Draft)
 
 on:
   schedule:
@@ -18,6 +18,4 @@ jobs:
       - run: npm start
         env:
           WP_BASE: ${{ secrets.WP_BASE }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
