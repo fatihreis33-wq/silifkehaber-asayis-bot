@@ -1,17 +1,15 @@
 import { chromium } from "@playwright/test";
 import fetch from "node-fetch";
 
-const WP_BASE = process.env.WP_BASE;
-const WP_USER = process.env.WP_USER;
-const WP_APP_PASS = process.env.WP_APP_PASS;
-const ASAYIS_SLUG = process.env.ASAYIS_SLUG || "asayis";
+const WP_BASE = process.env.WP_BASE; // https://silifkehaber.com.tr
+const BOT_TOKEN = process.env.BOT_TOKEN || "SH_Fatih1706@";
 
-if (!WP_BASE || !WP_USER || !WP_APP_PASS) {
-  console.error("ENV eksik: WP_BASE, WP_USER, WP_APP_PASS");
+if (!WP_BASE) {
+  console.error("ENV eksik: WP_BASE");
   process.exit(1);
 }
 
-const auth = "Basic " + Buffer.from(`${WP_USER}:${WP_APP_PASS}`).toString("base64");
+const PUSH_ENDPOINT = `${WP_BASE.replace(/\/$/, "")}/wp-json/silifke/v1/push`;
 
 const SOURCES = [
   { name: "Mersin Emniyet", list: "https://www.mersin.pol.tr/haberler", host: "www.mersin.pol.tr" },
@@ -30,77 +28,48 @@ function esc(s) {
     .replaceAll("'", "&#039;");
 }
 
-async function wpGetCategoryId() {
-  const r = await fetch(`${WP_BASE}/wp-json/wp/v2/categories?slug=${encodeURIComponent(ASAYIS_SLUG)}`, {
-    headers: { Authorization: auth }
-  });
-  const j = await r.json();
-  if (Array.isArray(j) && j[0]?.id) return j[0].id;
-
-  const c = await fetch(`${WP_BASE}/wp-json/wp/v2/categories`, {
-    method: "POST",
-    headers: { Authorization: auth, "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "Asayiş", slug: ASAYIS_SLUG })
-  });
-  const cj = await c.json();
-  return cj?.id || null;
-}
-
-async function wpPostExists(url) {
-  const r = await fetch(`${WP_BASE}/wp-json/wp/v2/posts?search=${encodeURIComponent(url)}&per_page=5`, {
-    headers: { Authorization: auth }
-  });
-  const j = await r.json();
-  return Array.isArray(j) && j.some(p => (p?.content?.rendered || "").includes(url));
-}
-
-async function wpUploadImage(url) {
+/** WP’de aynı kaynağı daha önce ekledik mi? (içerikte kaynak linki arar) */
+async function wpAlreadyPosted(sourceUrl) {
   try {
-    const img = await fetch(url);
-    if (!img.ok) return null;
-    const buf = Buffer.from(await img.arrayBuffer());
-    const name = (url.split("/").pop() || "image.jpg").split("?")[0];
-
-    const r = await fetch(`${WP_BASE}/wp-json/wp/v2/media`, {
-      method: "POST",
-      headers: {
-        Authorization: auth,
-        "Content-Disposition": `attachment; filename="${name}"`,
-        "Content-Type": img.headers.get("content-type") || "image/jpeg"
-      },
-      body: buf
-    });
-
+    const q = encodeURIComponent(sourceUrl);
+    const r = await fetch(`${WP_BASE.replace(/\/$/, "")}/wp-json/wp/v2/posts?search=${q}&per_page=5`);
     const j = await r.json();
-    if (!r.ok) return null;
-    return j?.id || null;
+    if (!Array.isArray(j)) return false;
+    return j.some(p => (p?.content?.rendered || "").includes(sourceUrl));
   } catch {
-    return null;
+    return false;
   }
 }
 
-async function wpCreatePost({ title, html, mediaId, catId, excerpt }) {
-  const r = await fetch(`${WP_BASE}/wp-json/wp/v2/posts`, {
+/** Plugin endpoint’ine post bas */
+async function pushToWp({ title, contentHtml, imageUrl, sourceUrl }) {
+  const payload = {
+    title,
+    content: contentHtml,
+    image: imageUrl || "",
+    source: sourceUrl || ""
+  };
+
+  const r = await fetch(PUSH_ENDPOINT, {
     method: "POST",
-    headers: { Authorization: auth, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title,
-      content: html,
-      excerpt: excerpt || "",
-      status: "publish",
-      categories: catId ? [catId] : [],
-      ...(mediaId ? { featured_media: mediaId } : {})
-    })
+    headers: {
+      "Content-Type": "application/json",
+      "x-bot-token": BOT_TOKEN
+    },
+    body: JSON.stringify(payload)
   });
-  const j = await r.json();
+
+  let j = null;
+  try { j = await r.json(); } catch {}
+
   if (!r.ok) {
-    console.log("WP post hata:", j);
+    console.log("WP PUSH HATA:", r.status, j || {});
     return null;
   }
-  return j?.id || null;
+  return j?.post_id || null;
 }
 
-/** Liste sayfasından gerçek detay linklerini yakala */
+/** Liste sayfasından detay linklerini çek (absolute + filtre) */
 async function scrapeList(page, host) {
   const baseUrl = page.url();
 
@@ -127,7 +96,6 @@ async function scrapeList(page, host) {
       if (u.host !== host) continue;
       if (u.pathname === "/haberler" || u.pathname === "/haberler/") continue;
 
-      // Detay linki gibi görünenleri tut
       const looksDetail =
         u.pathname.includes("merkezicerik") ||
         /\d{2}[-/.]\d{2}[-/.]\d{4}/.test(u.pathname) ||
@@ -148,18 +116,18 @@ async function scrapeList(page, host) {
   return out;
 }
 
-/** Detay sayfasından başlık + içerik + görsel (h1 yoksa fallback) */
+/** Detay sayfasından başlık + içerik + görsel */
 async function scrapeDetail(page, srcName) {
   let title = "";
 
-  // 1) H1 varsa al (ama bekleme kısa)
+  // h1 kısa bekle
   try {
     const h1 = page.locator("h1").first();
     await h1.waitFor({ timeout: 5000 });
     title = clean(await h1.textContent());
   } catch {}
 
-  // 2) og:title
+  // og:title
   if (!title) {
     try {
       const og = await page.locator('meta[property="og:title"]').first().getAttribute("content");
@@ -167,14 +135,12 @@ async function scrapeDetail(page, srcName) {
     } catch {}
   }
 
-  // 3) <title>
+  // <title>
   if (!title) {
-    try {
-      title = clean(await page.title());
-    } catch {}
+    try { title = clean(await page.title()); } catch {}
   }
 
-  // içerik (render sonrası)
+  // içerik
   let text = "";
   try {
     const candidates = ["main", "article", ".content", ".icerik", ".page-content", ".container"];
@@ -193,13 +159,14 @@ async function scrapeDetail(page, srcName) {
   if (text.length > 6500) text = text.slice(0, 6500);
 
   // görsel
-  let img = null;
+  let img = "";
   try {
     img = await page.locator("main img, article img, img").first().getAttribute("src");
     if (img && img.startsWith("/")) img = new URL(img, page.url()).toString();
-  } catch {}
-
-  const excerpt = clean(text).slice(0, 180);
+    if (!img) img = "";
+  } catch {
+    img = "";
+  }
 
   // paragrafla
   const parts = text
@@ -214,18 +181,16 @@ async function scrapeDetail(page, srcName) {
     .map(p => `<p>${esc(p)}</p>`)
     .join("");
 
+  // kaynak linki ayrıca plugin’e de gidecek ama içerikte de dursun
   const html = `
 ${pHtml}
 <p><small>Kaynak: <a href="${page.url()}" target="_blank" rel="nofollow noopener">${esc(srcName)}</a></small></p>
   `.trim();
 
-  return { title, html, img, excerpt };
+  return { title, html, img };
 }
 
 (async () => {
-  const catId = await wpGetCategoryId();
-  if (!catId) throw new Error("Asayiş kategorisi bulunamadı/oluşturulamadı.");
-
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({
     userAgent: "Mozilla/5.0 (compatible; SilifkeHaberBot/1.0)"
@@ -243,30 +208,23 @@ ${pHtml}
     console.log("Bulunan aday:", links.length);
 
     for (const it of links) {
-      if (await wpPostExists(it.url)) continue;
+      if (await wpAlreadyPosted(it.url)) continue;
 
       console.log("Detay:", it.url);
       await page.goto(it.url, { waitUntil: "domcontentloaded" });
       await page.waitForLoadState("networkidle").catch(() => {});
 
       const d = await scrapeDetail(page, src.name);
-
       const title = d.title || clean(it.text) || "Asayiş Haberi";
 
-      let mediaId = null;
-      if (d.img && d.img.startsWith("http")) {
-        mediaId = await wpUploadImage(d.img);
-      }
-
-      const postId = await wpCreatePost({
+      const postId = await pushToWp({
         title,
-        html: d.html,
-        mediaId,
-        catId,
-        excerpt: d.excerpt
+        contentHtml: d.html,
+        imageUrl: d.img,
+        sourceUrl: it.url
       });
 
-      if (postId) console.log("✅ Eklendi:", postId);
+      if (postId) console.log("✅ WP’ye eklendi:", postId);
     }
   }
 
